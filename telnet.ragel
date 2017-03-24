@@ -1,0 +1,387 @@
+#include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+
+#include <stdint.h>
+#include <errno.h>
+#include <err.h>
+#include <sysexits.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include <arpa/inet.h>
+#include <arpa/telnet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+#include <vector>
+#include <string>
+
+typedef std::basic_string<uint8_t> ustring;
+
+/*
+ * telnet proxy
+ *
+ */
+
+%%{
+    machine telnet_out;
+    alphtype unsigned char;
+    variable cs cs_out;
+
+    action push { v.push_back(fc); }
+
+    IAC     = 255; # /* interpret as command: */
+
+    main_out := (
+        any $push
+      | 0x0d  0x0a $push
+      | 0x0d ^0x0a ${ v.push_back(0); fhold; }
+      | 0xff ${ v.push_back(0xff); }
+    )**;
+
+    write data;
+
+    machine telnet_in;
+    alphtype unsigned char;
+
+    variable cs cs_in;
+
+    action push { v.push_back(fc); }
+    action ss_push { ss.push_back(fc); }
+
+    IAC     = 255; # /* interpret as command: */
+    DONT    = 254; # /* you are not to use option */
+    DO      = 253; # /* please, you use option */
+    WONT    = 252; # /* I won't use option */
+    WILL    = 251; # /* I will use option */
+    SB      = 250; # /* interpret as subnegotiation */
+    GA      = 249; # /* you may reverse the line */
+    EL      = 248; # /* erase the current line */
+    EC      = 247; # /* erase the current character */
+    AYT     = 246; # /* are you there */
+    AO      = 245; # /* abort output--but let prog finish */
+    IP      = 244; # /* interrupt process--permanently */
+    BREAK   = 243; # /* break */
+    DM      = 242; # /* data mark--for connect. cleaning */
+    NOP     = 241; # /* nop */
+    SE      = 240; # /* end sub negotiation */
+    EOR     = 239; # /* end of record (transparent mode) */
+    ABORT   = 238; # /* Abort process */
+    SUSP    = 237; # /* Suspend process */
+    EOF     = 236; # /* End of file: EOF is already used... */
+
+    SYNCH   = 242; # /* for telfunc calls */
+
+
+    subopt = ( ^IAC | IAC IAC )** @ss_push;
+
+    iac = (
+            IAC $push
+          | AYT ${ /* are you there? */ ack.append((const uint8_t *)"\r\n[Yes]\r\n", 9);  }
+          | NOP
+          # interrupt, break, abort output
+          | IP | BREAK | AO | SUSP | ABORT
+
+          # erase character/erase line
+          | EC | EL
+          | DM
+          | SB ${ ss.clear(); } subopt IAC SE ${ subopt(ss, ack); }
+          | WILL any ${ telnet_will(fc, ack); }
+          | WONT any ${ telnet_wont(fc, ack); }
+          | DO any ${ telnet_do(fc, ack); }
+          | DONT any ${ telnet_dont(fc, ack); }
+          | EOR | EOF
+    );
+
+    main := (
+        ^0xff $push
+      |  0x0d  0x00
+      |  0x0d ^0x00 ${ fhold; }
+      |  0xff  iac $err{ fgoto main; }
+    )**;
+
+    write data;
+
+}%%
+
+
+/* other side says they will or will not do something */
+
+void telnet_will(uint8_t x, ustring &ack) {
+    switch(x) {
+        case TELOPT_SGA:
+        case TELOPT_BINARY:
+        case TELOPT_LINEMODE:
+            ack.append( { IAC, DO, x });
+            break;
+
+        default:
+            ack.append( { IAC, DONT, x });
+    }
+}
+
+void telnet_wont(uint8_t x, ustring &ack) {
+
+    switch(x) {
+        case TELOPT_SGA:
+        case TELOPT_LINEMODE:
+            ack.append( { IAC, DO, x });
+            break;
+
+        default:
+            ack.append( { IAC, DONT, x });
+    }
+
+
+}
+
+/* they request we do or do not do something */
+
+void telnet_do(uint8_t x, ustring &ack) {
+    switch(x) {
+        case TELOPT_SGA:
+        case TELOPT_BINARY:
+        case TELOPT_ECHO:
+            ack.append({ IAC, WILL, x });
+            break;
+        default:
+            ack.append({ IAC, WONT, x });
+            break;
+    }
+}
+
+void telnet_dont(uint8_t x, ustring &ack) {
+    switch(x) {
+        case TELOPT_SGA:
+            ack.append( { IAC, WILL, x });
+            break;
+        default:
+            ack.append({ IAC, WONT, x });
+            break;
+    }
+}
+
+void subopt(ustring &ss, ustring &ack) {
+
+}
+
+
+
+void telnet(int stdin1, int stdout1, int stdin2, int stdout2) {
+
+    struct pollfd fds[2] = { { stdin1, POLLIN, 0 } , { stdin2, POLLIN, 0 } };
+    unsigned char buffer[1024];
+    int ok;
+
+    ustring v;
+    ustring ack;
+    ustring ss;
+    v.reserve(1024*2);
+    ss.reserve(512);
+
+    unsigned char cs_in;
+    unsigned char cs_out;
+
+    %% machine telnet_in;
+    %% write init;
+
+    %% machine telnet_out;
+    %% write init;
+
+
+    for(;;) {
+        fds[0].revents = 0;
+        fds[1].revents = 0;
+        ok = poll(fds, 2, -1);
+        if (ok < 0) {
+            if (errno == EINTR) continue;
+            warn("poll");
+            continue;
+        }
+        if (ok == 0) continue;
+
+        if (fds[0].revents & POLLIN) {
+            // read from remote server. need to handle IACs
+            for(;;) {
+                ok = read(stdin1, buffer, sizeof(buffer));
+                if (ok < 0) break;
+                if (ok == 0) break;
+
+                unsigned char *p = buffer;
+                unsigned char *pe = buffer + ok;
+                unsigned char *eof = nullptr;
+
+                // this is a dirty hack so ragel goto labels don't collide.
+                [&](){
+                    %% machine telnet_in;
+                    %% write exec;
+                }();
+
+                if (v.size()) {
+                    write(stdout2, v.data(), v.size());
+                    v.clear();
+                }
+
+                if (ack.size()) {
+                    write(stdout1, ack.data(), ack.size());
+                    ack.clear();
+                }
+
+            }
+
+        }
+
+        if (fds[1].revents & POLLIN) { 
+            // read from local server.  need to escape IAC
+            for(;;) {
+                ok = read(stdin2, buffer, sizeof(buffer));
+                if (ok < 0) break;
+                if (ok == 0) break;
+
+                unsigned char *p = buffer;
+                unsigned char *pe = buffer + ok;
+                unsigned char *eof = nullptr;
+
+                // this is a dirty hack so ragel goto labels don't collide.
+                [&](){
+                    %% machine telnet_out;
+                    %% write exec;
+                }();
+
+                if (v.size()) {
+                    write(stdout1, v.data(), v.size());
+                    v.clear();
+                }
+            }
+        }
+
+        if ((fds[0].revents | fds[1].revents) & POLLHUP) return;
+    }
+}
+
+void non_blocking(int fd) {
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+}
+
+static int server_socket(int port, int backlog) {
+    struct sockaddr_in sa;
+
+    int ok;
+    int flags;
+    int opt = 1;
+
+    int fd = socket(PF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { err(EX_OSERR, "socket"); return -1; }
+
+    //non_blocking(fd);
+    flags = fcntl(fd, F_GETFD);
+    fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+
+    ok = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (ok < 0) { err(EX_OSERR, "setsockopt(..., SO_REUSEADDR, ...)"); close(fd); return -1; }
+
+    memset(&sa,0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    ok = bind(fd, (struct sockaddr *) &sa, sizeof(sa));
+    if (ok < 0) { err(EX_OSERR, "bind"); close(fd); return -1; }
+
+    ok = listen(fd, backlog);
+    if (ok < 0) { err(EX_OSERR, "listen"); close(fd); return -1; }
+
+    return fd;
+}
+
+static int client_socket(int port) {
+
+    struct sockaddr_in sa;
+
+    int fd = socket(PF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { warn("socket"); return -1; }  
+
+
+    memset(&sa,0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    int ok = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    if (ok < 0) {
+        warn("connect");
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+const uint8_t init[] = {
+    //IAC, DO, TELOPT_SGA,
+//    IAC, DONT, TELOPT_SUPDUP,
+//    IAC, DONT, TELOPT_SUPDUPOUTPUT,
+    IAC, WILL, TELOPT_BINARY,
+    IAC, WILL, TELOPT_ECHO,
+    IAC, WILL, TELOPT_SGA,
+    IAC, WONT, TELOPT_LINEMODE,
+};
+
+int main(int argc, char **argv) {
+
+    int c;
+    bool _s = false;
+
+    while ((c = getopt(argc, argv, "s")) != -1) {
+        switch(c) {
+            case 's': _s = true; break;
+        }
+    }
+
+    if (_s) {
+
+        int server_fd = server_socket(6502, 1);
+
+        struct sockaddr_in addr;
+        socklen_t length = sizeof(addr);
+
+        for(;;) {
+            int fd = accept(server_fd, (struct sockaddr *)&addr, &length);
+            if (fd < 0) { warn("accept"); continue; }
+            non_blocking(fd);
+
+            int socket = client_socket(6809);
+            if( socket < 0) {
+                write(STDOUT_FILENO, "\r\nUnable to connect. Try again later.\r\n", 39);
+                close(fd);
+                continue;
+            }
+
+            non_blocking(socket);
+
+            write(fd, init, sizeof(init));
+            telnet(fd, fd, socket, socket);
+            close(socket);
+            close(fd);
+        }
+
+        return 0;
+    }
+
+
+    non_blocking(0);
+    non_blocking(1);
+
+    int socket = client_socket(6809);
+    if( socket < 0) {
+        write(STDOUT_FILENO, "\r\nUnable to connect. Try again later.\r\n", 39);
+        exit(1);
+    }
+
+    non_blocking(socket);
+
+    write(STDOUT_FILENO, init, sizeof(init));
+    telnet(STDIN_FILENO, STDOUT_FILENO, socket, socket);
+    close(socket);
+    exit(0);
+}
