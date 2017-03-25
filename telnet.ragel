@@ -173,6 +173,7 @@ void telnet(int stdin1, int stdout1, int stdin2, int stdout2) {
     struct pollfd fds[2] = { { stdin1, POLLIN, 0 } , { stdin2, POLLIN, 0 } };
     unsigned char buffer[1024];
     int ok;
+    bool exit = false;
 
     ustring v;
     ustring ack;
@@ -190,7 +191,7 @@ void telnet(int stdin1, int stdout1, int stdin2, int stdout2) {
     %% write init;
 
 
-    for(;;) {
+    while (!exit) {
         fds[0].revents = 0;
         fds[1].revents = 0;
         ok = poll(fds, 2, -1);
@@ -205,9 +206,13 @@ void telnet(int stdin1, int stdout1, int stdin2, int stdout2) {
             // read from remote server. need to handle IACs
             for(;;) {
                 ok = read(stdin1, buffer, sizeof(buffer));
-                if (ok < 0) break;
-                if (ok == 0) break;
-
+                if (ok < 0) {
+                    if (errno == EINTR || errno == EAGAIN) break;
+                    warn("read");
+                    exit = true;
+                    break;
+                }
+                if (ok == 0) {exit = true; break; }
                 unsigned char *p = buffer;
                 unsigned char *pe = buffer + ok;
                 unsigned char *eof = nullptr;
@@ -227,7 +232,7 @@ void telnet(int stdin1, int stdout1, int stdin2, int stdout2) {
                     write(stdout1, ack.data(), ack.size());
                     ack.clear();
                 }
-
+                if (ok < sizeof(buffer)) break;
             }
 
         }
@@ -236,8 +241,13 @@ void telnet(int stdin1, int stdout1, int stdin2, int stdout2) {
             // read from local server.  need to escape IAC
             for(;;) {
                 ok = read(stdin2, buffer, sizeof(buffer));
-                if (ok < 0) break;
-                if (ok == 0) break;
+                if (ok < 0) {
+                    if (errno == EINTR || errno == EAGAIN) break;
+                    warn("read");
+                    exit = true;
+                    break;
+                }
+                if (ok == 0) { exit = true; break; }
 
                 unsigned char *p = buffer;
                 unsigned char *pe = buffer + ok;
@@ -253,6 +263,7 @@ void telnet(int stdin1, int stdout1, int stdin2, int stdout2) {
                     write(stdout1, v.data(), v.size());
                     v.clear();
                 }
+                if (ok < sizeof(buffer)) break;
             }
         }
 
