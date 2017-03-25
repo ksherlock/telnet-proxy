@@ -256,7 +256,10 @@ void telnet(int stdin1, int stdout1, int stdin2, int stdout2) {
             }
         }
 
-        if ((fds[0].revents | fds[1].revents) & POLLHUP) return;
+        if ((fds[0].revents | fds[1].revents) & POLLHUP) {
+            fprintf(stderr, "POLLHUP\n");
+            return;
+        }
     }
 }
 
@@ -350,9 +353,11 @@ int main(int argc, char **argv) {
             if (fd < 0) { warn("accept"); continue; }
             non_blocking(fd);
 
+            fprintf(stderr, "connection from: %s\n", inet_ntoa(addr.sin_addr));
+
             int socket = client_socket(6809);
             if( socket < 0) {
-                write(STDOUT_FILENO, "\r\nUnable to connect. Try again later.\r\n", 39);
+                write(fd, "\r\nUnable to connect. Try again later.\r\n", 39);
                 close(fd);
                 continue;
             }
@@ -361,8 +366,11 @@ int main(int argc, char **argv) {
 
             write(fd, init, sizeof(init));
             telnet(fd, fd, socket, socket);
+
+            fprintf(stderr, "closing connection\n");
             close(socket);
             close(fd);
+
         }
 
         return 0;
