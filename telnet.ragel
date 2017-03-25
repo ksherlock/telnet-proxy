@@ -16,6 +16,7 @@
 
 #include <vector>
 #include <string>
+#include <stdexcept>
 
 typedef std::basic_string<uint8_t> ustring;
 
@@ -346,20 +347,41 @@ const uint8_t init[] = {
     IAC, WONT, TELOPT_LINEMODE,
 };
 
+static uint16_t parse_port(const std::string &s) {
+    unsigned long l;
+    size_t pos;
+    try {
+        l = stoul(s, &pos, 10);
+        if (l == 0 || l > 65535) throw std::out_of_range("");
+        if (pos != s.length()) throw std::invalid_argument("");
+    } catch (std::exception &e) {
+        errx(EX_USAGE, "Invalid port: %s", s.c_str());
+    }
+    return l;
+}
+
 int main(int argc, char **argv) {
 
     int c;
-    bool _s = false;
+    unsigned _s = 0;
+    unsigned _p = 6809;
 
-    while ((c = getopt(argc, argv, "s")) != -1) {
+    while ((c = getopt(argc, argv, "s:p:")) != -1) {
         switch(c) {
-            case 's': _s = true; break;
+            case 's': {
+                _s = parse_port(optarg);
+                break;
+            }
+            case 'p': {
+                _p = parse_port(optarg);
+                break;
+            }
         }
     }
 
     if (_s) {
 
-        int server_fd = server_socket(6502, 1);
+        int server_fd = server_socket(_s, 1);
 
         struct sockaddr_in addr;
         socklen_t length = sizeof(addr);
@@ -372,7 +394,7 @@ int main(int argc, char **argv) {
 
             fprintf(stderr, "connection from: %s\n", inet_ntoa(addr.sin_addr));
 
-            int socket = client_socket(6809);
+            int socket = client_socket(_p);
             if( socket < 0) {
                 write(fd, "\r\nUnable to connect. Try again later.\r\n", 39);
                 close(fd);
@@ -395,10 +417,10 @@ int main(int argc, char **argv) {
     }
 
 
-    non_blocking(0);
-    non_blocking(1);
+    non_blocking(STDIN_FILENO);
+    non_blocking(STDOUT_FILENO);
 
-    int socket = client_socket(6809);
+    int socket = client_socket(_p);
     if( socket < 0) {
         write(STDOUT_FILENO, "\r\nUnable to connect. Try again later.\r\n", 39);
         exit(1);
