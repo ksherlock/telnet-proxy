@@ -1,0 +1,8 @@
+[Unit]
+Description=Telnet Proxy
+After=local-fs.target
+
+[Service]
+ExecStart=-/usr/local/bin/telnet-proxy
+User=<user>
+StandardInput=socket

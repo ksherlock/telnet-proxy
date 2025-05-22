@@ -1,0 +1,10 @@
+[Unit]
+Description=Telnet Proxy
+
+[Socket]
+ListenStream=<port>
+Accept=true
+MaxConnections=3
+
+[Install]
+WantedBy=sockets.target
